@@ -1,77 +1,118 @@
-// Proxy mTLS SERPRO - encaminha chamadas do app Lovable para a API SERPRO
-// usando o certificado A1 e-CNPJ do escritorio.
 import express from "express";
-import fs from "node:fs";
 import { Agent, fetch as undiciFetch } from "undici";
+import fs from "node:fs";
+import forge from "node-forge";
+import jwt from "jsonwebtoken";
 
 const PORT = process.env.PORT || 10000;
 const SHARED_SECRET = process.env.SHARED_SECRET;
-const PFX_PASSWORD = process.env.PFX_PASSWORD;
+const PFX_PASSWORD = process.env.PFX_PASSWORD || "";
 const SERPRO_BASE = "https://gateway.apiserpro.serpro.gov.br";
 
-if (!SHARED_SECRET) { console.error("SHARED_SECRET nao configurado"); process.exit(1); }
-if (!PFX_PASSWORD) { console.error("PFX_PASSWORD nao configurado"); process.exit(1); }
-
-// Carrega o .pfx de uma das fontes (ordem de prioridade):
-// 1. /etc/secrets/cert.pfx.b64  (Secret File em base64 - recomendado no Render)
-// 2. /etc/secrets/cert.pfx      (Secret File binario)
-// 3. process.env.PFX_BASE64     (variavel de ambiente em base64)
 function loadPfx() {
-  const b64Path = "/etc/secrets/cert.pfx.b64";
-  const binPath = "/etc/secrets/cert.pfx";
-  if (fs.existsSync(b64Path)) {
-    const text = fs.readFileSync(b64Path, "utf8").replace(/\s+/g, "");
-    return Buffer.from(text, "base64");
-  }
-  if (fs.existsSync(binPath)) {
-    return fs.readFileSync(binPath);
+  const paths = ["/etc/secrets/cert.pfx.b64", "/etc/secrets/cert.pfx"];
+  for (const p of paths) {
+    if (fs.existsSync(p)) {
+      const raw = fs.readFileSync(p);
+      if (p.endsWith(".b64")) {
+        return Buffer.from(raw.toString("utf8").replace(/\s+/g, ""), "base64");
+      }
+      return raw;
+    }
   }
   if (process.env.PFX_BASE64) {
     return Buffer.from(process.env.PFX_BASE64.replace(/\s+/g, ""), "base64");
   }
-  console.error("Certificado nao encontrado. Adicione /etc/secrets/cert.pfx.b64 (Secret File em base64) ou variavel PFX_BASE64.");
-  process.exit(1);
+  throw new Error("Certificado PFX não encontrado");
 }
 
-const pfx = loadPfx();
-const dispatcher = new Agent({ connect: { pfx: [{ buf: pfx, passphrase: PFX_PASSWORD }] } });
+function extractKeyAndCert(pfxBuf, password) {
+  const p12Asn1 = forge.asn1.fromDer(forge.util.createBuffer(pfxBuf.toString("binary")));
+  const p12 = forge.pkcs12.pkcs12FromAsn1(p12Asn1, password);
+  let privateKeyPem = null;
+  let certDerB64 = null;
+  for (const sc of p12.safeContents) {
+    for (const bag of sc.safeBags) {
+      if (
+        bag.type === forge.pki.oids.pkcs8ShroudedKeyBag ||
+        bag.type === forge.pki.oids.keyBag
+      ) {
+        privateKeyPem = forge.pki.privateKeyToPem(bag.key);
+      } else if (bag.type === forge.pki.oids.certBag && !certDerB64) {
+        const der = forge.asn1.toDer(forge.pki.certificateToAsn1(bag.cert)).getBytes();
+        certDerB64 = forge.util.encode64(der);
+      }
+    }
+  }
+  if (!privateKeyPem || !certDerB64) {
+    throw new Error("Falha ao extrair chave/certificado do PFX");
+  }
+  return { privateKeyPem, certDerB64 };
+}
+
+const pfxBuffer = loadPfx();
+const { privateKeyPem, certDerB64 } = extractKeyAndCert(pfxBuffer, PFX_PASSWORD);
+console.log("[serpro-proxy] PFX carregado, chave e certificado extraídos");
+
+const dispatcher = new Agent({
+  connect: { pfx: pfxBuffer, passphrase: PFX_PASSWORD },
+});
+
+function buildJwtToken() {
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    { iat: now, exp: now + 300, jti: `${now}-${Math.random().toString(36).slice(2)}` },
+    privateKeyPem,
+    {
+      algorithm: "RS256",
+      header: { alg: "RS256", typ: "JWT", x5c: [certDerB64] },
+    }
+  );
+}
 
 const app = express();
-app.use(express.json({ limit: "5mb" }));
-app.use(express.text({ type: ["text/*", "application/x-www-form-urlencoded"], limit: "5mb" }));
+app.use(express.raw({ type: "*/*", limit: "10mb" }));
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "serpro-mtls-proxy" }));
+app.get("/", (_req, res) => res.json({ ok: true, service: "serpro-mtls-proxy", version: "2.0.0" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.all("/serpro/*", async (req, res) => {
-  if (req.header("x-shared-secret") !== SHARED_SECRET) {
-    return res.status(401).json({ error: "unauthorized" });
+  if (req.headers["x-shared-secret"] !== SHARED_SECRET) {
+    return res.status(401).json({ error: "invalid shared secret" });
   }
-  const subPath = req.path.replace(/^\/serpro/, "");
-  const qIdx = req.originalUrl.indexOf("?");
-  const qs = qIdx >= 0 ? req.originalUrl.slice(qIdx) : "";
-  const url = SERPRO_BASE + subPath + qs;
+  const path = req.url.replace(/^\/serpro/, "");
+  const url = `${SERPRO_BASE}${path}`;
+
   const headers = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    if (["host","connection","content-length","x-shared-secret"].includes(k.toLowerCase())) continue;
+    const kl = k.toLowerCase();
+    if (["host", "x-shared-secret", "content-length", "connection", "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "x-real-ip"].includes(kl)) continue;
     headers[k] = v;
   }
-  let body;
-  if (req.method !== "GET" && req.method !== "HEAD") {
-    body = typeof req.body === "string" ? req.body : JSON.stringify(req.body ?? {});
+  if (!path.startsWith("/token")) {
+    headers["jwt_token"] = buildJwtToken();
   }
+
   try {
-    const upstream = await undiciFetch(url, { method: req.method, headers, body, dispatcher });
-    const buf = Buffer.from(await upstream.arrayBuffer());
-    upstream.headers.forEach((value, key) => {
-      if (["content-encoding","transfer-encoding","content-length"].includes(key.toLowerCase())) return;
-      res.setHeader(key, value);
+    const upstream = await undiciFetch(url, {
+      method: req.method,
+      headers,
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
+      dispatcher,
     });
-    res.status(upstream.status).send(buf);
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.status(upstream.status);
+    upstream.headers.forEach((v, k) => {
+      const kl = k.toLowerCase();
+      if (!["transfer-encoding", "content-encoding", "connection"].includes(kl)) {
+        res.setHeader(k, v);
+      }
+    });
+    res.send(buf);
   } catch (err) {
-    console.error("Proxy error:", err);
-    res.status(502).json({ error: "proxy_failed", message: String(err?.message || err) });
+    console.error("[serpro-proxy] erro:", err);
+    res.status(502).json({ error: String(err?.message || err) });
   }
 });
 
-app.listen(PORT, () => console.log("SERPRO mTLS proxy ouvindo em :" + PORT));
+app.listen(PORT, () => console.log(`[serpro-proxy] ouvindo na porta ${PORT}`));
