@@ -1,0 +1,13 @@
+{
+  "name": "serpro-mtls-proxy",
+  "version": "3.1.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "node-fetch": "^2.7.0"
+  }
+}
