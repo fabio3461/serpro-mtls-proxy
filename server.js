@@ -1,4 +1,4 @@
-// server.js — SERPRO mTLS proxy (Integra Contador) v3.1.0
+// server.js — SERPRO mTLS proxy (Integra Contador) v3.2.0
 const https = require("https");
 const express = require("express");
 const morgan = require("morgan");
@@ -8,6 +8,7 @@ const PORT = process.env.PORT || 10000;
 const SHARED_SECRET = process.env.SHARED_SECRET;
 const PFX_BASE64 = process.env.PFX_BASE64;
 const PFX_PASSWORD = process.env.PFX_PASSWORD || "";
+const ADN_BRIDGE_SECRET = process.env.ADN_BRIDGE_SECRET;
 
 function requiredEnv(name, value) {
   if (!value) {
@@ -44,7 +45,7 @@ try {
 
 const app = express();
 app.use(morgan("tiny"));
-app.use(express.json({ limit: "2mb", type: ["application/json", "application/*+json"] }));
+app.use(express.json({ limit: "5mb", type: ["application/json", "application/*+json"] }));
 app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 app.use(express.text({ type: "text/*", limit: "2mb" }));
 
@@ -59,6 +60,7 @@ function getHeader(req, name) {
 
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
+  if (req.path === "/v1/adn-nfse") return next(); // ADN usa header proprio (x-adn-secret)
 
   const sharedSecret = getHeader(req, "x-shared-secret");
   if (sharedSecret !== SHARED_SECRET) {
@@ -69,7 +71,7 @@ app.use((req, res, next) => {
 });
 
 app.get("/health", (_req, res) => {
-  return sendJson(res, 200, { ok: true, version: "3.1.0" });
+  return sendJson(res, 200, { ok: true, version: "3.2.0" });
 });
 
 app.post("/serpro/token", async (req, res) => {
@@ -142,11 +144,56 @@ app.post("/serpro/integra-contador/v1/:op", async (req, res) => {
   }
 });
 
+// ===== ADN NFS-e Nacional (PFX por empresa, vem na requisicao) =====
+app.post("/v1/adn-nfse", async (req, res) => {
+  try {
+    if (!ADN_BRIDGE_SECRET) {
+      return sendJson(res, 500, { ok: false, error: "ADN_BRIDGE_SECRET ausente no proxy" });
+    }
+    const adnSecret = getHeader(req, "x-adn-secret");
+    if (adnSecret !== ADN_BRIDGE_SECRET) {
+      return sendJson(res, 401, { ok: false, error: "invalid_adn_secret" });
+    }
+
+    const { cnpj, pfx_base64, password, data_inicial, data_final, pagina = 1 } = req.body || {};
+    if (!cnpj || !pfx_base64 || !password || !data_inicial || !data_final) {
+      return sendJson(res, 400, { ok: false, error: "missing_fields" });
+    }
+
+    const pfxBuf = Buffer.from(String(pfx_base64).replace(/\s/g, ""), "base64");
+    const agent = new https.Agent({ pfx: pfxBuf, passphrase: password, keepAlive: false });
+
+    const url = `https://adn.nfse.gov.br/contribuintes/${cnpj}/nfses?dataInicial=${data_inicial}&dataFinal=${data_final}&pagina=${pagina}`;
+    const upstream = await fetch(url, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      agent,
+    });
+
+    const text = await upstream.text();
+    if (!upstream.ok) {
+      return sendJson(res, 502, { ok: false, error: `adn_${upstream.status}: ${text.slice(0, 300)}` });
+    }
+
+    let data;
+    try { data = JSON.parse(text); } catch { data = {}; }
+    const xmls = (data && data.nfses ? data.nfses : []).map((n) => Buffer.from(n.xml || "").toString("base64"));
+    return sendJson(res, 200, {
+      ok: true,
+      xmls,
+      proxima_pagina: (data && data.proximaPagina) || null,
+    });
+  } catch (error) {
+    console.error("[serpro-proxy] ERRO /v1/adn-nfse:", error && error.stack ? error.stack : String(error));
+    return sendJson(res, 500, { ok: false, error: String((error && error.message) || error) });
+  }
+});
+
 app.use((req, res) => {
   return sendJson(res, 404, { error: "not found" });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`[serpro-proxy] ouvindo na porta ${PORT}`);
-  console.log("[serpro-proxy] version: 3.1.0");
+  console.log("[serpro-proxy] version: 3.2.0");
 });
